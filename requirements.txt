@@ -8,3 +8,4 @@ langchain-core
 langchain-community
 langchain-classic
 langchain-google-genai
+google-api-core
