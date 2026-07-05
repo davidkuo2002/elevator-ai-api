@@ -51,28 +51,33 @@ def load_knowledge_base():
 
 global_retriever = load_knowledge_base()
 
-# --- 4. AI 核心處理邏輯 ---
+# --- AI 核心處理邏輯 ---
 def invoke_expert_ai(user_query: str, retriever):
     retrieved_docs = retriever.invoke(user_query)
     context_text = "\n\n".join([doc.page_content for doc in retrieved_docs])
     
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=API_KEY)
+    # 💡 秘訣 1：加入 temperature=0.1，讓 AI 回答極度穩定、不加料
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash", 
+        google_api_key=API_KEY,
+        temperature=0.1 
+    )
+    
+    # 💡 秘訣 2：使用「極簡快查」版本的 Prompt
     prompt_template = ChatPromptTemplate.from_template(
-        "你是一位具備 20 年經驗的資深電梯維修專家。請『嚴格根據以下提供的手冊參考資料』，詳細、專業且有條理地協助現場維修人員。\n"
-        "如果參考資料中沒有提到相關資訊，請回答「手冊中未提及此狀況，請聯絡原廠支援」，絕不能自行編造內容（禁止幻覺）。\n\n"
-        "為了讓現場技師能快速且安全地執行，請『務必』依照以下結構詳細回覆：\n"
-        "1. 🚨 **安全確認**：執行此維修前，必須注意的安全事項（例如：是否需先切斷主電源、確認車廂位置等）。\n"
-        "2. 🔍 **故障確診與原因**：請先明確指出該故障碼在手冊中的「正式定義」，接著詳細列出導致此故障的所有可能原因。\n" # <--- 這裡微調了
-        "3. 🛠️ **逐步檢查與排除流程**：提供具體、按順序（Step-by-Step）的維修與測試步驟。請盡量詳細說明該量測哪個接點、期待的數值為何等細節。\n"
-        "4. 💡 **後續觀察建議**：維修完成後，應如何進行測試以確認問題已徹底解決。\n\n"
+        "你是一位極度講求效率的電梯維修專家。請『嚴格根據以下提供的手冊參考資料』，給出最扼要、精準的回答。\n"
+        "如果參考資料沒有提到，只能回答「手冊未提及此狀況，請聯絡原廠支援」，絕不盲目猜測。\n\n"
+        "【輸出嚴格規則】：\n"
+        "1. 零廢話：不需要問候語、前言或結語，直接給答案。\n"
+        "2. 極簡條列：只列出「核心原因」與「關鍵處置動作」。\n"
+        "3. 數據優先：如果有提到電壓、接點編號或特定零件，必須優先列出。\n\n"
         "【手冊參考資料】：\n{context}\n\n"
         "【現場狀況】：\n{question}"
     )
-
-
-
+    
     chain = prompt_template | llm | StrOutputParser()
     return chain.invoke({"context": context_text, "question": user_query})
+
 
 # ==========================================
 # --- 5. UI 介面：分步導覽 (Wizard) 邏輯 ---
