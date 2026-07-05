@@ -4,9 +4,11 @@ import streamlit as st
 from dotenv import load_dotenv
 import utils 
 
+# 導入 Google API 例外處理模組 (用來攔截 429 錯誤)
+import google.api_core.exceptions
+
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
-# 確保使用我們剛剛修正的正確套件路徑
 from langchain_classic.retrievers import EnsembleRetriever 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -18,7 +20,6 @@ API_KEY = os.getenv("GOOGLE_API_KEY")
 st.set_page_config(page_title="電梯維修 AI 專家", page_icon="🛗", layout="centered")
 
 # --- 2. 狀態管理 (Session State) ---
-# 用來記住目前在哪一頁，以及使用者輸入的資料
 if 'step' not in st.session_state:
     st.session_state.step = 1
 if 'machine_model' not in st.session_state:
@@ -43,7 +44,10 @@ def load_knowledge_base():
             bm25_retriever = pickle.load(f)
         bm25_retriever.k = 4
         
-        retriever = EnsembleRetriever(retrievers=[bm25_retriever, faiss_retriever], weights=[0.7, 0.3])
+        retriever = EnsembleRetriever(
+            retrievers=[bm25_retriever, faiss_retriever], 
+            weights=[0.7, 0.3] 
+        )
         return retriever
     except Exception as e:
         st.error(f"知識庫載入失敗: {e}")
@@ -51,19 +55,21 @@ def load_knowledge_base():
 
 global_retriever = load_knowledge_base()
 
-# --- AI 核心處理邏輯 ---
+# --- 4. AI 核心處理邏輯 (極簡精準版 + 除錯模式) ---
 def invoke_expert_ai(user_query: str, retriever):
     retrieved_docs = retriever.invoke(user_query)
     context_text = "\n\n".join([doc.page_content for doc in retrieved_docs])
     
-    # 💡 秘訣 1：加入 temperature=0.1，讓 AI 回答極度穩定、不加料
+    # 開發者除錯：印出 AI 實際拿到的手冊內容
+    st.info(f"🕵️‍♂️ [開發者除錯] AI 拿到的手冊內容：\n{context_text}")
+    
+    # 溫度設為 0.1，讓 AI 回答極度精確、不加料
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash", 
         google_api_key=API_KEY,
         temperature=0.1 
     )
     
-    # 💡 秘訣 2：使用「極簡快查」版本的 Prompt
     prompt_template = ChatPromptTemplate.from_template(
         "你是一位極度講求效率的電梯維修專家。請『嚴格根據以下提供的手冊參考資料』，給出最扼要、精準的回答。\n"
         "如果參考資料沒有提到，只能回答「手冊未提及此狀況，請聯絡原廠支援」，絕不盲目猜測。\n\n"
@@ -78,14 +84,11 @@ def invoke_expert_ai(user_query: str, retriever):
     chain = prompt_template | llm | StrOutputParser()
     return chain.invoke({"context": context_text, "question": user_query})
 
-
 # ==========================================
 # --- 5. UI 介面：分步導覽 (Wizard) 邏輯 ---
 # ==========================================
 
 st.title("🛗 電梯 AI 專家系統")
-
-# 顯示進度條
 progress_text = f"目前進度：第 {st.session_state.step} / 3 步"
 st.progress(st.session_state.step / 3, text=progress_text)
 
@@ -94,19 +97,21 @@ st.progress(st.session_state.step / 3, text=progress_text)
 # ------------------------------------------
 if st.session_state.step == 1:
     st.header("步驟 1：選擇電梯機型")
-    st.markdown("請確認您目前正在維修的電梯系統。")
+    
+    AVAILABLE_MODELS = ["CHIMAX", "HPM", "IDE"]
+    current_model = st.session_state.machine_model
+    default_index = AVAILABLE_MODELS.index(current_model) if current_model in AVAILABLE_MODELS else 0
     
     selected_model = st.selectbox(
         "電梯機型", 
-        ["CHIMAX", "HPM", "IDE"],
-        index=["CHIMAX", "HPM", "IED"].index(st.session_state.machine_model)
+        AVAILABLE_MODELS,
+        index=default_index
     )
     
-    # 佔滿寬度的大按鈕，方便戴手套點擊
     if st.button("下一步：輸入故障資訊 ➡️", use_container_width=True):
         st.session_state.machine_model = selected_model
         st.session_state.step = 2
-        st.rerun() # 強制重新整理畫面進入下一頁
+        st.rerun()
 
 # ------------------------------------------
 # 第二頁：輸入故障碼與現場狀況
@@ -139,13 +144,11 @@ elif st.session_state.step == 2:
 elif st.session_state.step == 3:
     st.header("步驟 3：AI 診斷結果")
     
-    # 顯示使用者剛剛輸入的摘要
     with st.expander("📝 檢視您輸入的查詢條件", expanded=False):
         st.write(f"- **機型：** {st.session_state.machine_model}")
         st.write(f"- **故障碼：** {st.session_state.error_code or '無'}")
         st.write(f"- **症狀：** {st.session_state.symptoms or '無'}")
     
-    # 開始呼叫 AI 進行診斷
     if global_retriever is None:
         st.error("系統尚未準備好（知識庫未載入），請檢查後台設定。")
     else:
@@ -157,13 +160,17 @@ elif st.session_state.step == 3:
                 st.success("✅ 診斷完成")
                 st.markdown("### 🛠️ 維修建議")
                 st.info(advice)
+                
+            # 專門攔截 Google API 額度用盡的錯誤
+            except google.api_core.exceptions.ResourceExhausted:
+                st.error("⏳ 系統目前查詢人數較多（API 頻率限制），請等待 1 分鐘後再重新點擊診斷！")
+            # 攔截其他未知錯誤
             except Exception as e:
-                st.error("❌ 診斷過程發生錯誤")
+                st.error("❌ 診斷過程發生未知的系統錯誤")
                 st.code(str(e))
     
-    st.divider() # 分隔線
+    st.divider() 
     if st.button("🔄 處理下一台電梯 (重新開始)", use_container_width=True):
-        # 清空資料並回到第一頁
         st.session_state.error_code = ""
         st.session_state.symptoms = ""
         st.session_state.step = 1
