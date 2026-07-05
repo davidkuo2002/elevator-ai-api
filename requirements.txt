@@ -1,0 +1,10 @@
+streamlit
+python-dotenv
+jieba
+faiss-cpu
+rank_bm25
+langchain
+langchain-core
+langchain-community
+langchain-classic
+langchain-google-genai

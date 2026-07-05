@@ -1,0 +1,220 @@
+📚 電梯維修 AI 專家系統 - 階段性技術手冊 (v1.0)
+📌 1. 專案簡介
+本專案為一個基於 FastAPI 與 LangChain 打造的電梯維修 RAG (檢索增強生成) 系統。
+系統能讀取原廠電梯手冊 (Markdown 格式)，將其轉化為 FAISS 向量庫與 BM25 關鍵字庫。當維修技師輸入故障碼與症狀時，API 會進行混合檢索，並呼叫 Google Gemini 模型給出精準的中文維修建議。
+
+核心技術棧 (Tech Stack)
+後端框架：FastAPI (自帶 Swagger UI 測試介面)
+
+AI 引擎：Google Gemini API (gemini-2.5-flash 與 gemini-embedding-001)
+
+RAG 檢索框架：LangChain
+
+向量資料庫：FAISS (語義搜尋)
+
+關鍵字搜尋：BM25 + jieba (精準匹配故障碼)
+
+🛠️ 2. 環境建置與還原指南
+如果未來換電腦或交接給新人，請依照以下步驟「一鍵還原」開發環境：
+
+步驟 1：建立虛擬環境
+Bash
+python -m venv venv
+# Windows 啟動虛擬環境:
+venv\Scripts\activate
+# Mac/Linux 啟動虛擬環境:
+source venv/bin/activate
+步驟 2：安裝必要套件
+請執行以下指令安裝所有依賴套件：
+
+Bash
+pip install fastapi uvicorn pydantic python-dotenv tenacity langchain-google-genai langchain-community langchain-text-splitters faiss-cpu rank_bm25 jieba
+步驟 3：設定環境變數
+在專案根目錄建立 .env 檔案，內容格式如下（注意：檔名絕對不能是 .env.txt）：
+
+程式碼片段
+GOOGLE_API_KEY=AQ.你的真實金鑰字串_不要有空格也沒有引號
+📂 3. 專案核心程式碼 (可直接複製還原)
+專案目前包含三個核心 Python 檔案與一個手冊資料夾 manuals/。
+
+檔案 A：utils.py (共用工具)
+用途：提供斷詞功能，獨立出來是為了解決 pickle 命名空間衝突。
+
+Python
+import jieba
+
+def chinese_tokenizer(text):
+    """專為 BM25 設計的繁體中文斷詞函數"""
+    return list(jieba.cut(text))
+檔案 B：create_db.py (知識庫建置腳本)
+用途：讀取 manuals/*.md，進行 Markdown 標題切片，並加上防爆機制上傳給 Google 建立索引。
+執行方式：python create_db.py
+
+Python
+import os
+import glob
+import pickle
+import time
+from dotenv import load_dotenv
+from utils import chinese_tokenizer
+from langchain_core.documents import Document
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.retrievers import BM25Retriever
+from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+
+load_dotenv()
+API_KEY = os.getenv("GOOGLE_API_KEY")
+
+def build_real_knowledge_base():
+    md_files = glob.glob("manuals/*.md")
+    if not md_files: return
+    
+    headers_to_split_on = [("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")]
+    markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+
+    all_splits = []
+    for file_path in md_files:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            md_text = f.read()
+        splits = text_splitter.split_documents(markdown_splitter.split_text(md_text))
+        for split in splits:
+            split.metadata["source"] = os.path.basename(file_path)
+        all_splits.extend(splits)
+
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", google_api_key=API_KEY)
+    
+    batch_size = 10 
+    faiss_db = None
+    for i in range(0, len(all_splits), batch_size):
+        batch = all_splits[i:i + batch_size]
+        try:
+            if faiss_db is None:
+                faiss_db = FAISS.from_documents(batch, embeddings)
+            else:
+                faiss_db.add_documents(batch)
+        except Exception:
+            time.sleep(60) # 遭遇 API 限制時強制冷卻
+            if faiss_db is None:
+                faiss_db = FAISS.from_documents(batch, embeddings)
+            else:
+                faiss_db.add_documents(batch)
+        if i + batch_size < len(all_splits):
+            time.sleep(10)
+
+    faiss_db.save_local("faiss_index")
+    
+    bm25_retriever = BM25Retriever.from_documents(all_splits, preprocess_func=chinese_tokenizer)
+    with open("bm25_retriever.pkl", "wb") as f:
+        pickle.dump(bm25_retriever, f)
+
+if __name__ == "__main__":
+    build_real_knowledge_base()
+檔案 C：main.py (後端主程式 API)
+用途：掛載本地知識庫，提供防重試機制的 API 介面。
+執行方式：uvicorn main:app --reload
+
+Python
+import os
+import pickle
+import traceback
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
+from utils import chinese_tokenizer
+
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+load_dotenv()
+API_KEY = os.getenv("GOOGLE_API_KEY")
+
+app = FastAPI(title="電梯 AI 專家系統 API", version="1.0.0")
+global_retriever = None
+
+@app.on_event("startup")
+async def startup_event():
+    global global_retriever
+    try:
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", google_api_key=API_KEY)
+        faiss_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
+        faiss_retriever = faiss_db.as_retriever(search_kwargs={"k": 2}) 
+        
+        with open("bm25_retriever.pkl", "rb") as f:
+            bm25_retriever = pickle.load(f)
+        bm25_retriever.k = 2
+        
+        global_retriever = EnsembleRetriever(retrievers=[bm25_retriever, faiss_retriever], weights=[0.4, 0.6])
+        print("✅ 知識庫掛載成功！")
+    except Exception as e:
+        print(f"❌ 知識庫掛載失敗: {e}")
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=8))
+def invoke_expert_ai(user_query: str):
+    retrieved_docs = global_retriever.invoke(user_query)
+    context_text = "\n\n".join([doc.page_content for doc in retrieved_docs])
+    print(f"\n[後台檢索結果]：\n{context_text}\n")
+
+    # 注意：對話模型不加 'models/' 前綴，且使用 2.5 最新版
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=API_KEY)
+    
+    prompt_template = ChatPromptTemplate.from_template(
+        "你是一位資深的電梯維修專家。請『嚴格根據以下提供的手冊參考資料』，回答維修人員的問題。\n"
+        "如果參考資料中沒有提到，請回答「手冊中未提及此狀況，請聯絡原廠支援」，不要自己瞎猜。\n\n"
+        "【手冊參考資料】：\n{context}\n\n"
+        "【現場狀況】：\n{question}"
+    )
+    chain = prompt_template | llm | StrOutputParser()
+    return chain.invoke({"context": context_text, "question": user_query})
+
+class RepairRequest(BaseModel):
+    error_code: str = Field(..., example="E32")
+    symptoms: str = Field(default="", example="門無法完全關閉")
+    machine_model: str = Field(default="Hitachi-V2")
+
+class RepairResponse(BaseModel):
+    advice: str
+    status: str
+
+@app.post("/api/v1/repair-advice", response_model=RepairResponse)
+async def get_repair_advice(request: RepairRequest):
+    try:
+        user_query = f"機型：{request.machine_model}，故障碼：{request.error_code}，症狀：{request.symptoms}"
+        ai_response = invoke_expert_ai(user_query)
+        return RepairResponse(advice=ai_response, status="success")
+    except Exception as e:
+        traceback.print_exc() 
+        raise HTTPException(status_code=500, detail=f"系統錯誤：{str(e)}")
+⚠️ 4. 踩坑血淚史與解決方案 (Troubleshooting)
+這是本專案最寶貴的經驗，未來遇到類似報錯可直接查閱：
+
+找不到 API Key / 讀不到 .env
+
+原因：Windows 隱藏副檔名，導致檔案變成 .env.txt。
+
+解法：在 VS Code 檔案總管中確認檔名精準為 .env，且位置必須在專案根目錄。
+
+知識庫掛載失敗：Can't get attribute 'chinese_tokenizer'
+
+原因：Python pickle 套件的命名空間陷阱。它記住了斷詞函數是在 __main__ 空間打包的，但在 FastAPI 啟動時找不到。
+
+解法：把 chinese_tokenizer 函數抽離到獨立的 utils.py，讓打包與讀取時都 import 這個獨立檔案，統一命名空間。
+
+建置知識庫時報錯：429 RESOURCE_EXHAUSTED
+
+原因：Google 免費版金鑰限制 Embedding 每分鐘最多 100 次請求。
+
+解法：在 create_db.py 加入批次處理 (每次 10 筆) 與冷卻機制 (time.sleep(10))，並在例外處理中強制休息 60 秒。
+
+網頁報 500 錯誤 / 終端機報錯 404 NOT_FOUND (找不到模型)
+
+原因 1：Google 舊版 gemini-1.5-flash 模型已被官方下架淘汰。
+
+原因 2：LangChain 設定對話模型時，前面加上了 models/ 前綴。
+
+解法：全面升級至 gemini-2.5-flash，且寫法不包含前綴（即 model="gemini-2.5-flash"）；但 Embedding 模型依然需要前綴（即 model="models/gemini-embedding-001"）。

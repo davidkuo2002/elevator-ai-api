@@ -1,0 +1,7 @@
+# 忽略環境變數與金鑰
+.env
+.env.txt
+
+# 忽略虛擬環境
+venv/
+__pycache__/
